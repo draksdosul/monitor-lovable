@@ -1,6 +1,9 @@
 """
-Backend - Monitor Lovable Ads (v3)
+Backend - Monitor Lovable Ads (v4)
 API hospedada no Railway
+
+Detecção de anúncios via UTM/fbclid no URLScan
+em vez da API do Facebook (que exige verificação da Meta).
 """
 
 from flask import Flask, jsonify, request
@@ -9,12 +12,10 @@ import requests
 import time
 from urllib.parse import urlparse
 import os
-import re
 
 app = Flask(__name__)
 CORS(app)
 
-FB_ACCESS_TOKEN = os.environ.get("FB_ACCESS_TOKEN", "")
 URLSCAN_API_KEY = os.environ.get("URLSCAN_API_KEY", "")
 
 # Domínios padrão de plataformas para ignorar
@@ -32,6 +33,9 @@ DOMINIOS_PLATAFORMA = [
     "railway.app",
     "render.com",
 ]
+
+# Parâmetros que indicam tráfego pago do Facebook
+FB_PARAMS = ["fbclid", "utm_source", "utm_campaign", "utm_medium"]
 
 LIMITE_POR_PAGINA = 15
 
@@ -54,40 +58,34 @@ def dominio_e_plataforma(dominio: str) -> bool:
 def extrair_dominio_da_query(query: str) -> str:
     """
     Extrai o domínio da query SOMENTE se a query for uma busca por domínio.
-    Exemplos:
-      - "utmify.com.br"           → "utmify.com.br"
-      - "page.domain:lovable.app" → "lovable.app"
-      - "filename:gptengineer"    → "" (não é domínio, não filtra)
+    Queries com operadores como filename:, hash:, etc. retornam vazio (não filtra).
     """
-    # Se a query tem operadores do URLScan (filename:, hash:, etc.), não é um domínio
-    operadores = ["filename:", "hash:", "ip:", "asn:", "tag:", "page.title:", "page.status:"]
+    operadores = ["filename:", "hash:", "ip:", "asn:", "tag:", "page.title:", "page.status:", "page.url:"]
     for op in operadores:
         if op in query.lower():
-            return ""  # Não filtra por domínio
+            return ""
 
-    # Se parece um domínio (tem ponto e não tem espaços)
+    import re
     query_limpa = query.strip().lower()
+
+    match = re.search(r"page\.domain:([^\s]+)", query_limpa)
+    if match:
+        return match.group(1)
+
     if "." in query_limpa and " " not in query_limpa:
-        # Extrai o domínio do operador page.domain: se presente
-        match = re.search(r"page\.domain:([^\s]+)", query_limpa)
-        if match:
-            return match.group(1)
         return extrair_dominio(query_limpa) or query_limpa
 
     return ""
 
 
-def buscar_urlscan(query: str, search_after: str = None) -> dict:
+def buscar_urlscan(query: str, search_after: str = None, tamanho: int = 50) -> dict:
+    """Busca no URLScan com a query fornecida."""
     url = "https://urlscan.io/api/v1/search/"
     headers = {"Content-Type": "application/json"}
     if URLSCAN_API_KEY:
         headers["API-Key"] = URLSCAN_API_KEY
 
-    params = {
-        "q": query,
-        "size": 50,
-    }
-
+    params = {"q": query, "size": tamanho}
     if search_after:
         params["search_after"] = search_after
 
@@ -104,33 +102,57 @@ def buscar_urlscan(query: str, search_after: str = None) -> dict:
 
 
 def verificar_anuncio_facebook(dominio: str) -> dict:
-    if not FB_ACCESS_TOKEN:
-        return {"anunciando": False, "erro": "Token do Facebook não configurado"}
+    """
+    Verifica se o domínio tem registros no URLScan com parâmetros
+    de tráfego pago do Facebook (fbclid, utm_source, utm_campaign).
+    Faz duas queries para maximizar a detecção.
+    """
 
-    url = "https://graph.facebook.com/v19.0/ads_archive"
-    params = {
-        "access_token": FB_ACCESS_TOKEN,
-        "ad_reached_countries": "BR",
-        "search_terms": dominio,
-        "ad_active_status": "ACTIVE",
-        "fields": "id,ad_delivery_start_time,page_name,page_id",
-        "limit": 5,
-    }
-    try:
-        resp = requests.get(url, params=params, timeout=10)
-        data = resp.json()
-        ads = data.get("data", [])
-        if ads:
-            return {
-                "anunciando": True,
-                "total_anuncios": len(ads),
-                "pagina_fb": ads[0].get("page_name", ""),
-                "inicio_veiculacao": ads[0].get("ad_delivery_start_time", ""),
-                "link_biblioteca": f"https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=BR&q={dominio}",
-            }
-        return {"anunciando": False}
-    except Exception as e:
-        return {"anunciando": False, "erro": str(e)}
+    # Query 1: fbclid (mais específico — quase certeza de clique em anúncio)
+    query_fbclid = f"page.domain:{dominio} page.url:fbclid"
+    dados_fbclid = buscar_urlscan(query_fbclid, tamanho=3)
+
+    if dados_fbclid.get("results"):
+        r = dados_fbclid["results"][0]
+        return {
+            "anunciando": True,
+            "indicador": "fbclid",
+            "total_registros": dados_fbclid.get("total", 1),
+            "ultimo_scan": r.get("task", {}).get("time", ""),
+            "url_exemplo": r.get("page", {}).get("url", ""),
+            "link_biblioteca": f"https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=BR&q={dominio}",
+        }
+
+    # Query 2: utm_source com facebook (também forte indicador)
+    query_utm = f"page.domain:{dominio} page.url:utm_source"
+    dados_utm = buscar_urlscan(query_utm, tamanho=5)
+
+    if dados_utm.get("results"):
+        # Verifica se algum resultado tem utm_source relacionado ao Facebook
+        for r in dados_utm["results"]:
+            url_pagina = r.get("page", {}).get("url", "").lower()
+            if any(fb in url_pagina for fb in ["facebook", "fb&", "fb=", "=fb", "utm_source=fb"]):
+                return {
+                    "anunciando": True,
+                    "indicador": "utm_facebook",
+                    "total_registros": dados_utm.get("total", 1),
+                    "ultimo_scan": r.get("task", {}).get("time", ""),
+                    "url_exemplo": r.get("page", {}).get("url", ""),
+                    "link_biblioteca": f"https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=BR&q={dominio}",
+                }
+
+        # Tem UTMs mas não confirmou Facebook — marca como "possível"
+        r = dados_utm["results"][0]
+        return {
+            "anunciando": None,  # None = possível, não confirmado
+            "indicador": "utm_generico",
+            "total_registros": dados_utm.get("total", 1),
+            "ultimo_scan": r.get("task", {}).get("time", ""),
+            "url_exemplo": r.get("page", {}).get("url", ""),
+            "link_biblioteca": f"https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=BR&q={dominio}",
+        }
+
+    return {"anunciando": False}
 
 
 def processar_resultados(resultados_urlscan: list, query: str) -> tuple:
@@ -138,7 +160,6 @@ def processar_resultados(resultados_urlscan: list, query: str) -> tuple:
     filtrados = []
     ultimo_sort = None
 
-    # Extrai domínio da query para filtrar (só se for busca por domínio)
     dominio_query = extrair_dominio_da_query(query)
 
     for r in resultados_urlscan:
@@ -148,16 +169,10 @@ def processar_resultados(resultados_urlscan: list, query: str) -> tuple:
 
         if not dominio:
             continue
-
-        # Ignora duplicatas
         if dominio in vistos:
             continue
-
-        # Ignora domínios de plataformas padrão
         if dominio_e_plataforma(dominio):
             continue
-
-        # Ignora domínio igual ao pesquisado (só quando a query é um domínio)
         if dominio_query and dominio_query in dominio.lower():
             continue
 
@@ -174,12 +189,12 @@ def processar_resultados(resultados_urlscan: list, query: str) -> tuple:
         if len(filtrados) >= LIMITE_POR_PAGINA:
             break
 
-    # Verifica Facebook para cada domínio
+    # Verifica anúncios para cada domínio
     resultados_finais = []
     for site in filtrados:
         fb = verificar_anuncio_facebook(site["dominio"])
         resultados_finais.append({**site, **fb})
-        time.sleep(0.3)
+        time.sleep(0.3)  # Respeita rate limit do URLScan
 
     proximo_cursor = ",".join(str(s) for s in ultimo_sort) if ultimo_sort else None
     return resultados_finais, proximo_cursor
@@ -187,7 +202,12 @@ def processar_resultados(resultados_urlscan: list, query: str) -> tuple:
 
 @app.route("/")
 def home():
-    return jsonify({"status": "online", "versao": "v3", "mensagem": "Monitor Lovable Ads - API rodando!"})
+    return jsonify({
+        "status": "online",
+        "versao": "v4",
+        "mensagem": "Monitor Lovable Ads - API rodando!",
+        "deteccao": "URLScan UTM/fbclid"
+    })
 
 
 @app.route("/buscar", methods=["GET"])
@@ -217,13 +237,15 @@ def buscar():
         })
 
     resultados, proximo_cursor = processar_resultados(resultados_brutos, query)
-    anunciando = [r for r in resultados if r.get("anunciando")]
+    anunciando = [r for r in resultados if r.get("anunciando") is True]
+    possiveis = [r for r in resultados if r.get("anunciando") is None]
 
     return jsonify({
         "query": query,
         "total_urlscan": dados_urlscan.get("total", 0),
         "total_retornados": len(resultados),
         "total_anunciando": len(anunciando),
+        "total_possiveis": len(possiveis),
         "resultados": resultados,
         "proximo_cursor": proximo_cursor,
     })
@@ -231,6 +253,7 @@ def buscar():
 
 @app.route("/checar", methods=["POST"])
 def checar_url():
+    """Checa um domínio específico informado pelo usuário."""
     data = request.json or {}
     url = data.get("url", "")
     dominio = extrair_dominio(url) if "/" in url else url.strip()
