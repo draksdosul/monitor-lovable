@@ -1,5 +1,5 @@
 """
-Backend - Monitor Lovable Ads (v2)
+Backend - Monitor Lovable Ads (v3)
 API hospedada no Railway
 """
 
@@ -9,6 +9,7 @@ import requests
 import time
 from urllib.parse import urlparse
 import os
+import re
 
 app = Flask(__name__)
 CORS(app)
@@ -37,7 +38,7 @@ LIMITE_POR_PAGINA = 15
 
 def extrair_dominio(url: str) -> str:
     try:
-        parsed = urlparse(url)
+        parsed = urlparse(url if "://" in url else "https://" + url)
         return parsed.netloc.replace("www.", "")
     except:
         return ""
@@ -50,9 +51,30 @@ def dominio_e_plataforma(dominio: str) -> bool:
     return False
 
 
-def dominio_contem_query(dominio: str, query: str) -> bool:
-    query_limpa = extrair_dominio(query) if "/" in query else query.lower().strip()
-    return query_limpa in dominio.lower()
+def extrair_dominio_da_query(query: str) -> str:
+    """
+    Extrai o domínio da query SOMENTE se a query for uma busca por domínio.
+    Exemplos:
+      - "utmify.com.br"           → "utmify.com.br"
+      - "page.domain:lovable.app" → "lovable.app"
+      - "filename:gptengineer"    → "" (não é domínio, não filtra)
+    """
+    # Se a query tem operadores do URLScan (filename:, hash:, etc.), não é um domínio
+    operadores = ["filename:", "hash:", "ip:", "asn:", "tag:", "page.title:", "page.status:"]
+    for op in operadores:
+        if op in query.lower():
+            return ""  # Não filtra por domínio
+
+    # Se parece um domínio (tem ponto e não tem espaços)
+    query_limpa = query.strip().lower()
+    if "." in query_limpa and " " not in query_limpa:
+        # Extrai o domínio do operador page.domain: se presente
+        match = re.search(r"page\.domain:([^\s]+)", query_limpa)
+        if match:
+            return match.group(1)
+        return extrair_dominio(query_limpa) or query_limpa
+
+    return ""
 
 
 def buscar_urlscan(query: str, search_after: str = None) -> dict:
@@ -64,7 +86,6 @@ def buscar_urlscan(query: str, search_after: str = None) -> dict:
     params = {
         "q": query,
         "size": 50,
-        "sort": "_score",
     }
 
     if search_after:
@@ -117,6 +138,9 @@ def processar_resultados(resultados_urlscan: list, query: str) -> tuple:
     filtrados = []
     ultimo_sort = None
 
+    # Extrai domínio da query para filtrar (só se for busca por domínio)
+    dominio_query = extrair_dominio_da_query(query)
+
     for r in resultados_urlscan:
         page = r.get("page", {})
         url = page.get("url", "")
@@ -124,11 +148,17 @@ def processar_resultados(resultados_urlscan: list, query: str) -> tuple:
 
         if not dominio:
             continue
+
+        # Ignora duplicatas
         if dominio in vistos:
             continue
+
+        # Ignora domínios de plataformas padrão
         if dominio_e_plataforma(dominio):
             continue
-        if dominio_contem_query(dominio, query):
+
+        # Ignora domínio igual ao pesquisado (só quando a query é um domínio)
+        if dominio_query and dominio_query in dominio.lower():
             continue
 
         vistos.add(dominio)
@@ -157,7 +187,7 @@ def processar_resultados(resultados_urlscan: list, query: str) -> tuple:
 
 @app.route("/")
 def home():
-    return jsonify({"status": "online", "versao": "v2", "mensagem": "Monitor Lovable Ads - API rodando!"})
+    return jsonify({"status": "online", "versao": "v3", "mensagem": "Monitor Lovable Ads - API rodando!"})
 
 
 @app.route("/buscar", methods=["GET"])
@@ -180,6 +210,8 @@ def buscar():
         return jsonify({
             "query": query,
             "total_urlscan": 0,
+            "total_retornados": 0,
+            "total_anunciando": 0,
             "resultados": [],
             "proximo_cursor": None,
         })
