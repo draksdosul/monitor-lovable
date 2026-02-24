@@ -1,6 +1,6 @@
 """
-Backend - Monitor Lovable Ads
-API que será hospedada no Railway
+Backend - Monitor Lovable Ads (v2)
+API hospedada no Railway
 """
 
 from flask import Flask, jsonify, request
@@ -11,40 +11,78 @@ from urllib.parse import urlparse
 import os
 
 app = Flask(__name__)
-CORS(app)  # Permite que o frontend do Lovable acesse esta API
+CORS(app)
 
-# Pega as variáveis de ambiente configuradas no Railway
 FB_ACCESS_TOKEN = os.environ.get("FB_ACCESS_TOKEN", "")
 URLSCAN_API_KEY = os.environ.get("URLSCAN_API_KEY", "")
 
-URLSCAN_QUERIES = [
-    "page.domain:lovable.app",
-    "page.domain:lovableproject.com",
-    'filename:gptengineer',
+# Domínios padrão de plataformas para ignorar
+DOMINIOS_PLATAFORMA = [
+    "lovable.app",
+    "lovableproject.com",
+    "lovable.dev",
+    "vercel.app",
+    "netlify.app",
+    "github.io",
+    "pages.dev",
+    "web.app",
+    "firebaseapp.com",
+    "herokuapp.com",
+    "railway.app",
+    "render.com",
 ]
 
-def extrair_dominio(url):
+LIMITE_POR_PAGINA = 15
+
+
+def extrair_dominio(url: str) -> str:
     try:
         parsed = urlparse(url)
         return parsed.netloc.replace("www.", "")
     except:
-        return url
+        return ""
 
-def buscar_sites_urlscan(query):
+
+def dominio_e_plataforma(dominio: str) -> bool:
+    for plataforma in DOMINIOS_PLATAFORMA:
+        if dominio.endswith(plataforma):
+            return True
+    return False
+
+
+def dominio_contem_query(dominio: str, query: str) -> bool:
+    query_limpa = extrair_dominio(query) if "/" in query else query.lower().strip()
+    return query_limpa in dominio.lower()
+
+
+def buscar_urlscan(query: str, search_after: str = None) -> dict:
     url = "https://urlscan.io/api/v1/search/"
     headers = {"Content-Type": "application/json"}
     if URLSCAN_API_KEY:
         headers["API-Key"] = URLSCAN_API_KEY
 
-    params = {"q": query, "size": 50}
+    params = {
+        "q": query,
+        "size": 50,
+        "sort": "_score",
+    }
+
+    if search_after:
+        params["search_after"] = search_after
+
     try:
         resp = requests.get(url, headers=headers, params=params, timeout=15)
         resp.raise_for_status()
-        return resp.json().get("results", [])
-    except:
-        return []
+        data = resp.json()
+        return {
+            "results": data.get("results", []),
+            "total": data.get("total", 0),
+        }
+    except Exception as e:
+        return {"results": [], "total": 0, "erro": str(e)}
 
-def verificar_anuncio_facebook(dominio):
+
+def verificar_anuncio_facebook(dominio: str) -> dict:
     if not FB_ACCESS_TOKEN:
         return {"anunciando": False, "erro": "Token do Facebook não configurado"}
 
@@ -58,7 +96,7 @@ def verificar_anuncio_facebook(dominio):
         "limit": 5,
     }
     try:
-        resp = requests.get(url, params=params, timeout=15)
+        resp = requests.get(url, params=params, timeout=10)
         data = resp.json()
         ads = data.get("data", [])
         if ads:
@@ -74,57 +112,96 @@ def verificar_anuncio_facebook(dominio):
         return {"anunciando": False, "erro": str(e)}
 
 
+def processar_resultados(resultados_urlscan: list, query: str) -> tuple:
+    vistos = set()
+    filtrados = []
+    ultimo_sort = None
+
+    for r in resultados_urlscan:
+        page = r.get("page", {})
+        url = page.get("url", "")
+        dominio = extrair_dominio(url)
+
+        if not dominio:
+            continue
+        if dominio in vistos:
+            continue
+        if dominio_e_plataforma(dominio):
+            continue
+        if dominio_contem_query(dominio, query):
+            continue
+
+        vistos.add(dominio)
+        ultimo_sort = r.get("sort", [])
+        filtrados.append({
+            "dominio": dominio,
+            "url": url,
+            "pais": page.get("country", ""),
+            "data_scan": r.get("task", {}).get("time", ""),
+            "urlscan_link": f"https://urlscan.io/result/{r.get('_id', '')}/",
+        })
+
+        if len(filtrados) >= LIMITE_POR_PAGINA:
+            break
+
+    # Verifica Facebook para cada domínio
+    resultados_finais = []
+    for site in filtrados:
+        fb = verificar_anuncio_facebook(site["dominio"])
+        resultados_finais.append({**site, **fb})
+        time.sleep(0.3)
+
+    proximo_cursor = ",".join(str(s) for s in ultimo_sort) if ultimo_sort else None
+    return resultados_finais, proximo_cursor
+
+
 @app.route("/")
 def home():
-    return jsonify({"status": "online", "mensagem": "Monitor Lovable Ads - API rodando!"})
+    return jsonify({"status": "online", "versao": "v2", "mensagem": "Monitor Lovable Ads - API rodando!"})
 
 
 @app.route("/buscar", methods=["GET"])
 def buscar():
-    """Endpoint principal: busca sites Lovable e verifica anúncios no Brasil"""
-    
-    todos = {}
-    for query in URLSCAN_QUERIES:
-        resultados = buscar_sites_urlscan(query)
-        for r in resultados:
-            page = r.get("page", {})
-            url = page.get("url", "")
-            dominio = extrair_dominio(url)
-            if dominio and dominio not in todos:
-                todos[dominio] = {
-                    "dominio": dominio,
-                    "url": url,
-                    "pais": page.get("country", ""),
-                    "data_scan": r.get("task", {}).get("time", ""),
-                    "urlscan_link": f"https://urlscan.io/result/{r.get('_id', '')}/",
-                }
-        time.sleep(1)
+    """
+    Parâmetros:
+      - q: query de busca (ex: 'filename:gptengineer')
+      - search_after: cursor para paginação (opcional)
+    """
+    query = request.args.get("q", "").strip()
+    search_after = request.args.get("search_after", None)
 
-    sites = list(todos.values())
-    resultados_finais = []
+    if not query:
+        return jsonify({"erro": "Parâmetro 'q' é obrigatório"}), 400
 
-    for site in sites:
-        dominio = site["dominio"]
-        fb = verificar_anuncio_facebook(dominio)
-        resultados_finais.append({**site, **fb})
-        time.sleep(0.5)
+    dados_urlscan = buscar_urlscan(query, search_after)
+    resultados_brutos = dados_urlscan.get("results", [])
 
-    anunciando = [r for r in resultados_finais if r.get("anunciando")]
+    if not resultados_brutos:
+        return jsonify({
+            "query": query,
+            "total_urlscan": 0,
+            "resultados": [],
+            "proximo_cursor": None,
+        })
+
+    resultados, proximo_cursor = processar_resultados(resultados_brutos, query)
+    anunciando = [r for r in resultados if r.get("anunciando")]
 
     return jsonify({
-        "total_encontrados": len(sites),
+        "query": query,
+        "total_urlscan": dados_urlscan.get("total", 0),
+        "total_retornados": len(resultados),
         "total_anunciando": len(anunciando),
-        "resultados": resultados_finais,
-        "anunciando": anunciando,
+        "resultados": resultados,
+        "proximo_cursor": proximo_cursor,
     })
 
 
 @app.route("/checar", methods=["POST"])
 def checar_url():
-    """Checa uma URL específica informada pelo usuário"""
-    data = request.json
+    data = request.json or {}
     url = data.get("url", "")
-    dominio = extrair_dominio(url)
+    dominio = extrair_dominio(url) if "/" in url else url.strip()
     fb = verificar_anuncio_facebook(dominio)
     return jsonify({"dominio": dominio, **fb})
 
